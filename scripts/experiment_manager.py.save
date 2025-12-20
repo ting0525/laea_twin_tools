@@ -1,0 +1,137 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import rospy
+import math
+import subprocess
+from geometry_msgs.msg import PoseStamped
+from mavros_msgs.msg import State
+
+class ExperimentManager(object):
+    def __init__(self):
+        # ===== 可調參數（都可在 launch 或 rosrun 時覆寫）=====
+        self.pose_topic = rospy.get_param("~pose_topic", "/mavros/local_position/pose")
+        self.state_topic = rospy.get_param("~state_topic", "/mavros/state")
+
+        # 任務最長時間（秒）
+        self.max_duration_s = float(rospy.get_param("~max_duration_s", 900.0))  # 15 min
+
+        # 若 UAV 在 stationary_window_s 內移動距離 < stationary_eps_m → 視為探索結束
+        self.stationary_window_s = float(rospy.get_param("~stationary_window_s", 60.0))
+        self.stationary_eps_m = float(rospy.get_param("~stationary_eps_m", 0.25))
+
+        # 若 e_pos > fail_error_m（需你 logger 有在算 e_pos 才能做；此版本先不訂閱 e_pos）
+        # 先保留參數位，之後你要接 e_pos topic 再擴充
+        self.fail_error_m = float(rospy.get_param("~fail_error_m", 5.0))
+
+        # 要自動 kill 的 logger node 名稱
+        self.logger_node = rospy.get_param("~logger_node", "/slam_kpi_logger")
+
+        # 是否在結束時順便關閉 RViz（可選）
+        self.kill_rviz = bool(rospy.get_param("~kill_rviz", False))
+
+        # 等待 OFFBOARD + ARM 的 timeout
+        self.ready_timeout_s = float(rospy.get_param("~ready_timeout_s", 60.0))
+
+        # ===== runtime state =====
+        self.mav_state = None
+        self.last_pose = None
+        self.pose_history = []  # (t, x, y, z)
+
+        self.start_time = None
+
+        rospy.Subscriber(self.state_topic, State, self.cb_state, queue_size=10)
+        rospy.Subscriber(self.pose_topic, PoseStamped, self.cb_pose, queue_size=50)
+
+        rospy.loginfo("[experiment_manager] started.")
+
+    def cb_state(self, msg):
+        self.mav_state = msg
+
+    def cb_pose(self, msg):
+        p = msg.pose.position
+        t = msg.header.stamp.to_sec() if msg.header.stamp else rospy.get_time()
+        self.last_pose = (t, p.x, p.y, p.z)
+
+        # 保留最近 stationary_window_s 內的歷史
+        self.pose_history.append(self.last_pose)
+        cutoff = t - self.stationary_window_s
+        while self.pose_history and self.pose_history[0][0] < cutoff:
+            self.pose_history.pop(0)
+
+    def wait_until_ready(self):
+        """等待 OFFBOARD + armed，避免你還沒切模式就開始計時。"""
+        t0 = rospy.get_time()
+        rate = rospy.Rate(5)
+
+        while not rospy.is_shutdown():
+            if self.mav_state is not None and self.last_pose is not None:
+                mode_ok = (self.mav_state.mode == "OFFBOARD")
+                armed_ok = bool(self.mav_state.armed)
+                if mode_ok and armed_ok:
+                    rospy.loginfo("[experiment_manager] READY: OFFBOARD + ARMED confirmed.")
+                    return True
+
+            if rospy.get_time() - t0 > self.ready_timeout_s:
+                rospy.logwarn("[experiment_manager] READY timeout. Continue anyway (state not confirmed).")
+                return False
+
+            rate.sleep()
+
+    def moved_distance_in_window(self):
+        """計算 stationary_window_s 內的移動距離（用首尾距離近似）。"""
+        if len(self.pose_history) < 2:
+            return None
+        _, x0, y0, z0 = self.pose_history[0]
+        _, x1, y1, z1 = self.pose_history[-1]
+        dx, dy, dz = x1-x0, y1-y0, z1-z0
+        return math.sqrt(dx*dx + dy*dy + dz*dz)
+
+    def kill_node(self, node_name):
+        try:
+            subprocess.check_call(["rosnode", "kill", node_name])
+            rospy.loginfo("[experiment_manager] killed node: %s", node_name)
+            return True
+        except Exception as e:
+            rospy.logwarn("[experiment_manager] failed to kill node %s: %s", node_name, str(e))
+            return False
+
+    def run(self):
+        self.wait_until_ready()
+        self.start_time = rospy.get_time()
+        rospy.loginfo("[experiment_manager] mission started. max_duration_s=%.1f", self.max_duration_s)
+
+        rate = rospy.Rate(2)  # 2 Hz check
+        while not rospy.is_shutdown():
+            now = rospy.get_time()
+            elapsed = now - self.start_time
+
+            # 條件 1：超時
+            if elapsed > self.max_duration_s:
+                rospy.loginfo("[experiment_manager] DONE: timeout reached (%.1fs).", elapsed)
+                break
+
+            # 條件 2：長時間不移動（探索結束 / 卡住）
+            dist = self.moved_distance_in_window()
+            if dist is not None and dist < self.stationary_eps_m:
+                rospy.loginfo("[experiment_manager] DONE: stationary detected. dist=%.3fm in %.1fs",
+                              dist, self.stationary_window_s)
+                break
+
+            rate.sleep()
+
+        # ===== 任務結束：停止 logger，保留 ROS 系統（可選）=====
+        self.kill_node(self.logger_node)
+
+        if self.kill_rviz:
+            # 常見 RViz node 名稱是 /rviz 或 /rviz_*
+            self.kill_node("/rviz")
+
+        rospy.loginfo("[experiment_manager] experiment finished.")
+        return
+
+
+if __name__ == "__main__":
+    rospy.init_node("experiment_manager", anonymous=False)
+    node = ExperimentManager()
+    node.run

@@ -1,0 +1,23 @@
+<launch>
+  <!-- 允許批次管理器注入：每次 run 的識別 -->
+  <arg name="run_id" default="" />
+  <arg name="output_dir" default="/home/tim/laea/src/laea_twin_tools/laea_logs" />
+  <arg name="output_prefix" default="kpi_log" />
+  <arg name="log_rate" default="20.0" />
+  <arg name="model_name" default="iris_0" />
+
+  <!-- 維持你目前的參數風格：/slam_kpi_logger/... -->
+  <param name="slam_kpi_logger/model_name" value="$(arg model_name)" />
+  <param name="slam_kpi_logger/output_dir" value="$(arg output_dir)" />
+
+  <!-- output_name 改成可批次化：kpi_log_<run_id> -->
+  <!-- 若 run_id 空字串，logger 端會 fallback 用時間戳 -->
+  <param name="slam_kpi_logger/output_name" value="$(arg output_prefix)_$(arg run_id)" />
+
+  <param name="slam_kpi_logger/log_rate" value="$(arg log_rate)" />
+
+  <node pkg="laea_twin_tools"
+        type="slam_kpi_logger.py"
+        name="slam_kpi_logger"
+        output="screen"/>
+</launch>
