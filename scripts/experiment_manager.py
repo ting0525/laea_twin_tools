@@ -1,200 +1,323 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import rospy
+import os
 import math
+import signal
 import subprocess
+import rospy
 
 from geometry_msgs.msg import PoseStamped
-from mavros_msgs.msg import State
+from gazebo_msgs.msg import ModelStates
+from rosgraph_msgs.msg import Log as RosLog
 
 
-class ExperimentManager(object):
-    """
-    DT1 實驗協調節點：
-    1) 等待 OFFBOARD + ARMED（可選 timeout）
-    2) 自動 publish /traj_start_trigger（取代 RViz 2D Nav Goal 的啟動效果）
-    3) 監控 UAV 是否長時間不動，或超時
-    4) 任務結束後自動 kill KPI logger node
-    """
-
+class ExperimentManager:
     def __init__(self):
-        # ---------- Topics ----------
-        self.pose_topic = rospy.get_param("~pose_topic", "/mavros/local_position/pose")
-        self.state_topic = rospy.get_param("~state_topic", "/mavros/state")
+        rospy.init_node("experiment_manager", anonymous=False)
 
-        # 探索啟動 Trigger（你系統的正確入口）
+        # ----------------------------
+        # Orchestration params
+        # ----------------------------
+        self.num_runs = int(rospy.get_param("~num_runs", 1))
+        self.sleep_between_runs_s = float(rospy.get_param("~sleep_between_runs_s", 2.0))
+
+        # Trigger
         self.start_topic = rospy.get_param("~start_topic", "/traj_start_trigger")
-
-        # ⚠️ frame_id 請優先設定成你 pose 的 frame_id（可用下面的驗證指令取得）
         self.start_frame_id = rospy.get_param("~start_frame_id", "map")
-
-        # 發送 trigger 次數（避免 subscriber 啟動過程漏接）
-        self.start_pub_repeat = int(rospy.get_param("~start_pub_repeat", 5))
-
-        # ---------- Mission End Conditions ----------
-        # 任務最長時間（秒）
-        self.max_duration_s = float(rospy.get_param("~max_duration_s", 900.0))  # 15 min
-
-        # stationary 判斷：window 內移動距離 < eps → 視為任務完成/卡住
-        self.stationary_window_s = float(rospy.get_param("~stationary_window_s", 60.0))
-        self.stationary_eps_m = float(rospy.get_param("~stationary_eps_m", 0.25))
-
-        # ---------- Readiness ----------
-        # 等待 OFFBOARD + ARMED 最長時間
-        self.ready_timeout_s = float(rospy.get_param("~ready_timeout_s", 60.0))
-
-        # ---------- Nodes to Stop ----------
-        # 你的 KPI logger node 名稱（若不同請改參數）
-        self.logger_node = rospy.get_param("~logger_node", "/slam_kpi_logger")
-
-        # ---------- Runtime State ----------
-        self.mav_state = None
-        self.last_pose = None  # (t, x, y, z)
-        self.pose_history = []  # 最近 stationary_window_s 的 pose (t,x,y,z)
-        self.start_time = None
-
-        # ---------- ROS I/O ----------
-        rospy.Subscriber(self.state_topic, State, self.cb_state, queue_size=10)
-        rospy.Subscriber(self.pose_topic, PoseStamped, self.cb_pose, queue_size=50)
-
         self.start_pub = rospy.Publisher(self.start_topic, PoseStamped, queue_size=1, latch=True)
 
-        rospy.loginfo("[experiment_manager] started.")
-        rospy.loginfo("[experiment_manager] start_topic=%s frame=%s", self.start_topic, self.start_frame_id)
+        # ----------------------------
+        # Success token (唯一成功標準)
+        # ----------------------------
+        self.rosout_topic = rospy.get_param("~rosout_topic", "/rosout_agg")
+        self.finish_token = rospy.get_param("~finish_token", "finish exploration.")
+        # 強烈建議後續填上實際 node 名稱（例如 /fast_exploration_fsm），避免誤判
+        self.finish_node_name = rospy.get_param("~finish_node_name", "")  # "" = 不限制
+        rospy.Subscriber(self.rosout_topic, RosLog, self._rosout_cb, queue_size=200)
 
-    def cb_state(self, msg):
-        self.mav_state = msg
+        # ----------------------------
+        # Fail detection (GT vs EST)
+        # ----------------------------
+        self.model_name = rospy.get_param("~model_name", "iris_0")
+        self.fail_error_m = float(rospy.get_param("~fail_error_m", 10.0))
+        self.fail_hold_s = float(rospy.get_param("~fail_hold_s", 1.0))
 
-    def cb_pose(self, msg):
+        # Timeout: 沒 finish 一律視為非成功（刪檔）
+        self.max_duration_s = float(rospy.get_param("~max_duration_s", 900.0))
+
+        # ----------------------------
+        # Logger control
+        # ----------------------------
+        self.output_dir = rospy.get_param(
+            "~output_dir",
+            rospy.get_param(
+                "/slam_kpi_logger/output_dir",
+                os.path.expanduser("~/laea/src/laea_twin_tools/laea_logs")
+            )
+        )
+        # 這個參數你可以不改，維持 roslaunch <pkg> <launch>
+        self.logger_launch = rospy.get_param("~logger_launch", "laea_twin_tools slam_kpi_logger.launch")
+
+        # Dataset governance
+        self.delete_on_non_success = bool(rospy.get_param("~delete_on_non_success", True))
+
+        # ----------------------------
+        # Persistent Run ID (解決覆蓋的關鍵)
+        # ----------------------------
+        # 序號檔：跨重啟唯一遞增，確保永不覆蓋
+        self.run_seq_file = rospy.get_param("~run_seq_file", os.path.join(self.output_dir, "run_seq.txt"))
+
+        # ----------------------------
+        # Data inputs
+        # ----------------------------
+        self.gt_xyz = None
+        self.est_xyz = None
+        rospy.Subscriber("/gazebo/model_states", ModelStates, self._gt_cb, queue_size=10)
+        rospy.Subscriber("/mavros/local_position/pose", PoseStamped, self._est_cb, queue_size=50)
+
+        # Internal state
+        self._run_start_time = None
+        self._finish_seen = False
+        self._finish_time = None
+        self._fail_start_time = None
+
+        self._logger_proc = None
+
+    # ----------------------------
+    # Callbacks
+    # ----------------------------
+    def _rosout_cb(self, msg: RosLog):
+        if self._run_start_time is None:
+            return
+        if msg.header.stamp < self._run_start_time:
+            return
+        if self.finish_node_name and (msg.name != self.finish_node_name):
+            return
+        if self.finish_token in (msg.msg or ""):
+            self._finish_seen = True
+            self._finish_time = msg.header.stamp
+
+    def _gt_cb(self, msg: ModelStates):
+        try:
+            idx = msg.name.index(self.model_name)
+        except ValueError:
+            return
+        p = msg.pose[idx].position
+        self.gt_xyz = (p.x, p.y, p.z)
+
+    def _est_cb(self, msg: PoseStamped):
         p = msg.pose.position
-        t = msg.header.stamp.to_sec() if msg.header.stamp else rospy.get_time()
-        self.last_pose = (t, p.x, p.y, p.z)
+        self.est_xyz = (p.x, p.y, p.z)
 
-        # 保留最近 stationary_window_s 的歷史
-        self.pose_history.append(self.last_pose)
-        cutoff = t - self.stationary_window_s
-        while self.pose_history and self.pose_history[0][0] < cutoff:
-            self.pose_history.pop(0)
+    # ----------------------------
+    # Helpers
+    # ----------------------------
+    def _compute_e_pos(self):
+        if self.gt_xyz is None or self.est_xyz is None:
+            return None
+        dx = self.gt_xyz[0] - self.est_xyz[0]
+        dy = self.gt_xyz[1] - self.est_xyz[1]
+        dz = self.gt_xyz[2] - self.est_xyz[2]
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
 
-    def wait_until_ready(self):
-        """
-        等待 OFFBOARD + ARMED（避免探索還沒開始就計時）
-        若 timeout 仍未達成，仍會繼續往下跑（利於 debug / 不阻塞流程）
-        """
-        t0 = rospy.get_time()
-        rate = rospy.Rate(5)
-
+    def _wait_ready(self, timeout_s=60.0):
+        """最小 readiness gate：確保 GT/EST 都有資料"""
+        t0 = rospy.Time.now()
+        rate = rospy.Rate(10)
         while not rospy.is_shutdown():
-            mode_ok = False
-            armed_ok = False
-
-            if self.mav_state is not None:
-                mode_ok = (self.mav_state.mode == "OFFBOARD")
-                armed_ok = bool(self.mav_state.armed)
-
-            if mode_ok and armed_ok and self.last_pose is not None:
-                rospy.loginfo("[experiment_manager] READY: OFFBOARD + ARMED confirmed.")
+            if self.gt_xyz is not None and self.est_xyz is not None:
                 return True
-
-            if rospy.get_time() - t0 > self.ready_timeout_s:
-                rospy.logwarn("[experiment_manager] READY timeout. Continue anyway.")
+            if (rospy.Time.now() - t0).to_sec() > timeout_s:
                 return False
-
             rate.sleep()
+        return False
 
-    def publish_start_trigger(self):
-        """
-        取代 RViz 2D Nav Goal 的效果：對 /traj_start_trigger 發一個 PoseStamped。
-        建議用 UAV 當下位姿作為 trigger 的 position，避免 frame mismatch。
-        """
-        if self.last_pose is None:
-            rospy.logwarn("[experiment_manager] No pose yet, cannot publish start trigger.")
-            return False
-
-        _, x, y, z = self.last_pose
-
+    def _publish_start_trigger(self):
         msg = PoseStamped()
         msg.header.stamp = rospy.Time.now()
         msg.header.frame_id = self.start_frame_id
-
-        msg.pose.position.x = x
-        msg.pose.position.y = y
-        msg.pose.position.z = z
-
-        # orientation 不重要，給 unit quaternion
+        # 位置內容依你 waypoint_generator 行為；大多數情況 frame_id 正確即足夠
+        msg.pose.position.x = 0.0
+        msg.pose.position.y = 0.0
+        msg.pose.position.z = 0.0
         msg.pose.orientation.w = 1.0
+        self.start_pub.publish(msg)
 
-        rospy.loginfo(
-            "[experiment_manager] Publishing start trigger (%s) frame=%s at (%.2f, %.2f, %.2f)",
-            self.start_topic, self.start_frame_id, x, y, z
+    def _next_global_run_id(self) -> str:
+        """跨重啟的全域 run 序號：避免永遠 run_001 覆蓋"""
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        n = 0
+        if os.path.isfile(self.run_seq_file):
+            try:
+                with open(self.run_seq_file, "r") as f:
+                    n = int((f.read() or "0").strip())
+            except Exception:
+                n = 0
+
+        n += 1
+
+        # 原子更新：避免寫到一半中斷造成 seq 壞掉
+        tmp_path = self.run_seq_file + ".tmp"
+        with open(tmp_path, "w") as f:
+            f.write(str(n))
+        os.replace(tmp_path, self.run_seq_file)
+
+        return f"run_{n:03d}"
+
+    def _start_logger(self, run_id: str):
+        """
+        每個 run 啟動一次 logger，並把 run_id 帶進去
+        讓 logger 輸出：kpi_log_<run_id>.csv
+        """
+        if self._logger_proc is not None and self._logger_proc.poll() is None:
+            rospy.logwarn("Logger already running, terminating previous instance.")
+            self._stop_logger()
+
+        cmd = ["roslaunch"] + self.logger_launch.split() + [
+            f"run_id:={run_id}",
+            f"output_dir:={self.output_dir}",
+        ]
+        rospy.loginfo(f"[RUN {run_id}] start logger: {' '.join(cmd)}")
+
+        self._logger_proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            preexec_fn=os.setsid
         )
 
-        for _ in range(self.start_pub_repeat):
-            self.start_pub.publish(msg)
-            rospy.sleep(0.3)
+        # 給 logger 時間 set /laea_twin/current_log_path
+        rospy.sleep(1.0)
 
-        return True
-
-    def moved_distance_in_window(self):
-        """
-        計算 stationary_window_s 內的移動距離（首尾距離近似）
-        """
-        if len(self.pose_history) < 2:
-            return None
-        _, x0, y0, z0 = self.pose_history[0]
-        _, x1, y1, z1 = self.pose_history[-1]
-        dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
-        return math.sqrt(dx * dx + dy * dy + dz * dz)
-
-    def kill_node(self, node_name):
+        # 可選：快速稽核 current_log_path
         try:
-            subprocess.check_call(["rosnode", "kill", node_name])
-            rospy.loginfo("[experiment_manager] killed node: %s", node_name)
-            return True
-        except Exception as e:
-            rospy.logwarn("[experiment_manager] failed to kill node %s: %s", node_name, str(e))
-            return False
+            path = rospy.get_param("/laea_twin/current_log_path", "")
+            if not path:
+                rospy.logwarn(f"[RUN {run_id}] current_log_path is empty after logger start.")
+            else:
+                rospy.loginfo(f"[RUN {run_id}] current_log_path={path}")
+        except Exception:
+            rospy.logwarn(f"[RUN {run_id}] unable to read /laea_twin/current_log_path after logger start.")
 
-    def run(self):
-        # 1) 等待 ready（OFFBOARD+ARM）
-        self.wait_until_ready()
+    def _stop_logger(self):
+        if self._logger_proc is None:
+            return
+        if self._logger_proc.poll() is not None:
+            self._logger_proc = None
+            return
+        try:
+            os.killpg(os.getpgid(self._logger_proc.pid), signal.SIGINT)
+        except Exception:
+            pass
+        rospy.sleep(0.5)
+        self._logger_proc = None
 
-        # 2) 發探索啟動 trigger（等同 RViz）
-        self.publish_start_trigger()
+    def _delete_current_log(self, reason: str):
+        if not self.delete_on_non_success:
+            return
 
-        # 3) 開始計時與監控
-        self.start_time = rospy.get_time()
-        rospy.loginfo("[experiment_manager] mission started. max_duration_s=%.1f", self.max_duration_s)
+        try:
+            path = rospy.get_param("/laea_twin/current_log_path", "")
+        except KeyError:
+            path = ""
 
-        rate = rospy.Rate(2)
+        if not path:
+            rospy.logwarn(f"[DELETE] ({reason}) current_log_path param not set; skip delete.")
+            return
+
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                rospy.logwarn(f"[DELETE] ({reason}) removed log: {path}")
+            except Exception as e:
+                rospy.logerr(f"[DELETE] ({reason}) failed to remove {path}: {e}")
+        else:
+            rospy.logwarn(f"[DELETE] ({reason}) file not found: {path}")
+
+    # ----------------------------
+    # Run lifecycle
+    # ----------------------------
+    def _reset_run_flags(self):
+        self._run_start_time = rospy.Time.now()
+        self._finish_seen = False
+        self._finish_time = None
+        self._fail_start_time = None
+
+    def _monitor_one_run(self, run_id: str):
+        """
+        Return outcome:
+          - SUCCESS_FINISH
+          - FAIL_SLAM
+          - TIMEOUT_NO_FINISH
+        """
+        rate = rospy.Rate(20)
         while not rospy.is_shutdown():
-            now = rospy.get_time()
-            elapsed = now - self.start_time
+            # 1) success: finish token (唯一成功標準)
+            if self._finish_seen:
+                rospy.loginfo(f"[RUN {run_id}] SUCCESS_FINISH at {self._finish_time.to_sec():.3f}")
+                return "SUCCESS_FINISH"
 
-            # 條件 A：超時
-            if elapsed > self.max_duration_s:
-                rospy.loginfo("[experiment_manager] DONE: timeout reached (%.1fs).", elapsed)
-                break
+            # 2) fail: e_pos hold
+            epos = self._compute_e_pos()
+            if epos is not None and epos > self.fail_error_m:
+                if self._fail_start_time is None:
+                    self._fail_start_time = rospy.Time.now()
+                else:
+                    held = (rospy.Time.now() - self._fail_start_time).to_sec()
+                    if held >= self.fail_hold_s:
+                        rospy.logerr(f"[RUN {run_id}] FAIL_SLAM e_pos={epos:.2f}m held={held:.2f}s")
+                        return "FAIL_SLAM"
+            else:
+                self._fail_start_time = None
 
-            # 條件 B：長時間不動（探索完成/卡住）
-            dist = self.moved_distance_in_window()
-            if dist is not None and dist < self.stationary_eps_m:
-                rospy.loginfo(
-                    "[experiment_manager] DONE: stationary detected. dist=%.3fm in %.1fs",
-                    dist, self.stationary_window_s
-                )
-                break
+            # 3) timeout: no finish
+            elapsed = (rospy.Time.now() - self._run_start_time).to_sec()
+            if elapsed >= self.max_duration_s:
+                rospy.logwarn(f"[RUN {run_id}] TIMEOUT_NO_FINISH elapsed={elapsed:.1f}s")
+                return "TIMEOUT_NO_FINISH"
 
             rate.sleep()
 
-        # 4) 任務結束：停止 logger
-        self.kill_node(self.logger_node)
-        rospy.loginfo("[experiment_manager] experiment finished.")
+        return "ABORTED"
+
+    def run(self):
+        rospy.loginfo(f"[experiment_manager] num_runs={self.num_runs}, output_dir={self.output_dir}")
+        ok = self._wait_ready(timeout_s=60.0)
+        if not ok:
+            rospy.logerr("[experiment_manager] Inputs not ready: missing GT/EST. Abort.")
+            return
+
+        for _ in range(self.num_runs):
+            run_id = self._next_global_run_id()
+            rospy.loginfo(f"========== RUN {run_id} ==========")
+
+            self._reset_run_flags()
+
+            # 先開 logger，再 trigger（避免漏掉起始資料）
+            self._start_logger(run_id)
+            self._publish_start_trigger()
+
+            outcome = self._monitor_one_run(run_id)
+
+            # stop logger
+            self._stop_logger()
+
+            # governance: only keep SUCCESS_FINISH
+            if outcome != "SUCCESS_FINISH":
+                self._delete_current_log(reason=outcome)
+            else:
+                rospy.loginfo(f"[RUN {run_id}] kept log (SUCCESS_FINISH).")
+
+            rospy.sleep(self.sleep_between_runs_s)
+
+        rospy.loginfo("[experiment_manager] All runs completed.")
 
 
 if __name__ == "__main__":
-    rospy.init_node("experiment_manager", anonymous=False)
-    node = ExperimentManager()
-    node.run()
-
+    try:
+        mgr = ExperimentManager()
+        mgr.run()
+    except rospy.ROSInterruptException:
+        pass
